@@ -186,5 +186,31 @@ describe('repairCardChunks', () => {
         const result = repairCardChunks([cardChunk('ccv3', v3Card())]);
         expect(result.found).toBe(true);
         expect(result.changed).toBe(false);
+        expect(result.repaired).toBe(false);
+        expect(result.tagsChanged).toBe(false);
+    });
+
+    it('merges tags and repairs in one pass, reporting each independently', () => {
+        const dict = { mapping: { Female: ['girl'] }, removedTags: ['anypov'] };
+        const card = v3Card({ description: 'meet {char}', tags: ['girl', 'anypov', 'dragons'] });
+        const result = repairCardChunks([cardChunk('ccv3', card)], dict);
+
+        expect(result.changed).toBe(true);
+        expect(result.tagsChanged).toBe(true);
+        expect(result.repaired).toBe(true);
+
+        const chunk = result.chunks.find(c => c.data.toString('latin1').startsWith('ccv3\0'))!;
+        const decoded = decodeCard(chunk.data.subarray(chunk.data.indexOf(0) + 1)) as Record<string, any>;
+        expect(decoded.data.tags).toEqual(['Female', 'dragons']);
+        expect(decoded.data.description).toBe('meet {{char}}');
+    });
+
+    it('reports tagsChanged without repaired when only tags change', () => {
+        const dict = { mapping: { Female: ['girl'] }, removedTags: [] };
+        const card = v3Card({ tags: ['girl'] }); // already clean prose/spec
+        const result = repairCardChunks([cardChunk('ccv3', card)], dict);
+        expect(result.tagsChanged).toBe(true);
+        expect(result.repaired).toBe(false);
+        expect(result.changed).toBe(true);
     });
 });

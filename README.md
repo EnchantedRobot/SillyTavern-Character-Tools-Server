@@ -2,16 +2,16 @@
 
 Companion server plugin for the [SillyTavern Character Tools](https://github.com/EnchantedRobot/SillyTavern-Character-Tools) extension. It performs on-disk "surgery" on a user's SillyTavern data — repairing character cards and compressing images — using [pngquant](https://pngquant.org/) and [sharp](https://sharp.pixelplumbing.com/). The extension drives it and tells it *what* to do; this plugin does the file work.
 
-> **Note:** This plugin was consolidated from `SillyTavern-Image-Compressor-Server`. The plugin id (and therefore the API base path) is now `character-tools`: `/api/plugins/character-tools/…`. Tag merging is being folded into the character pass — see the extension repo for the current roadmap.
+> **Note:** This plugin was consolidated from `SillyTavern-Image-Compressor-Server`. The plugin id (and therefore the API base path) is now `character-tools`: `/api/plugins/character-tools/…`.
 
 The two directories are handled by **separate endpoints** with different goals:
 
-| Directory | Endpoint | PNG metadata | Max dimension | WEBP conversion | Card repair |
-|---|---|---|---|---|---|
-| `data/{user}/user/images/` | `/compress` | Not preserved | 2048px | Yes | No |
-| `data/{user}/characters/` | `/upgrade-characters` | Preserved (`chara`/`ccv3` chunk) | 2048px | Never | Yes |
+| Directory | Endpoint | PNG metadata | Max dimension | WEBP conversion | Tag merge | Card repair |
+|---|---|---|---|---|---|---|
+| `data/{user}/user/images/` | `/compress` | Not preserved | 2048px | Yes | No | No |
+| `data/{user}/characters/` | `/fix-characters` | Preserved (`chara`/`ccv3` chunk) | 2048px | Never | Yes | Yes |
 
-`/compress` only touches `user/images/`. Character cards are handled by `/upgrade-characters`, which compresses the image **and** upgrades/repairs the embedded card JSON in the same pass (see [Upgrade and repair characters](#upgrade-and-repair-characters)).
+`/compress` only touches `user/images/`. Character cards are handled by `/fix-characters`, which in a **single pass per card** applies the tag dictionary, upgrades/repairs the embedded card JSON, and compresses the image (see [Fix characters](#fix-characters)). The tag dictionary is owned by the extension and passed in the request body — this plugin holds no dictionary of its own.
 
 JPEG files are re-encoded at quality 75 with mozjpeg (progressive). `characters/` is never converted to WEBP: character cards store their JSON in a PNG `chara`/`ccv3` text chunk, which WEBP can't carry, so converting them would corrupt the card.
 
@@ -36,7 +36,8 @@ interface CompressionResult {
     filesScanned: number;
     filesSkipped: number;
     filesCompressed: number;
-    cardsRepaired: number; // character cards whose JSON was upgraded/repaired (0 for /compress)
+    cardsRepaired: number; // cards whose JSON was upgraded/repaired (0 for /compress)
+    tagsChanged: number;   // cards whose tags were rewritten by the dictionary (0 for /compress)
     bytesSaved: number;
     errors: string[];
 }
@@ -102,7 +103,7 @@ interface DirStats {
 
 `POST /api/plugins/character-tools/compress`
 
-Compresses `user/images/` only, skipping any file that was already processed in a previous run. Progress is stored in `data/{user}/.compress_state.json` and saved incrementally every 500 files, so a crash mid-run won't lose all progress. (Character cards are handled separately by `/upgrade-characters`.)
+Compresses `user/images/` only, skipping any file that was already processed in a previous run. Progress is stored in `data/{user}/.compress_state.json` and saved incrementally every 500 files, so a crash mid-run won't lose all progress. (Character cards are handled separately by `/fix-characters`.)
 
 ```bash
 curl -X POST http://localhost:8000/api/plugins/character-tools/compress \
@@ -122,11 +123,15 @@ curl -X POST http://localhost:8000/api/plugins/character-tools/reprocess-all \
   -d '{"user": "default-user"}'
 ```
 
-### Upgrade and repair characters
+### Fix characters
 
-`POST /api/plugins/character-tools/upgrade-characters`
+`POST /api/plugins/character-tools/fix-characters`
 
-Iterates over `characters/`, and for each card PNG **compresses the image and repairs/upgrades the embedded card JSON in a single pass**. This is a *lightweight* upgrade that only fixes things that are actually broken — it never rewrites prose, clears prompts, filters tags, or substitutes `{{char}}` for a name. Specifically it:
+Iterates over `characters/`, and for each card PNG runs the full character pass **in a single decode/write per card**: apply the tag dictionary, repair/upgrade the embedded card JSON, and compress the image.
+
+**1. Tag merge** (only when a `dictionary` is supplied — see below). Rewrites `data.tags`: each messy variant becomes its canonical, each removed tag is deleted, and the result is deduplicated case-insensitively with original order preserved. Matching is normalized (leading `#` stripped, whitespace collapsed, lowercased), so `#Female`, `  female `, and `FEMALE` all fold together.
+
+**2. Card repair.** A *lightweight* upgrade that only fixes things that are actually broken — it never rewrites prose, clears prompts, or substitutes `{{char}}` for a name. Specifically it:
 
 - **Upgrades V2 → V3**: `chara_card_v2` → `chara_card_v3` (spec_version `3.0`).
 - **Backfills required V3 fields**: adds `data.group_only_greetings` (`[]`), `character_book.extensions` (`{}`), and `use_regex: false` on any `character_book` entry missing it.
@@ -134,21 +139,35 @@ Iterates over `characters/`, and for each card PNG **compresses the image and re
   - `{char}` / `{user}` (single bracket) → `{{char}}` / `{{user}}`
   - `{{Char}}` / `{{USER}}` (any case) → lowercase canonical form
   - broken pronoun aliases `{{sub}}` `{{pos}}` `{{obj}}` `{{poss}}` `{{poss_p}}` `{{ref}}` (and single-bracket variants) → `{{user}}`
-- **Preserves everything else**, including unknown extension metadata such as `extensions.gallery_id` / `fav` and `_meta`, by mutating the decoded card in place rather than rebuilding it. Both the `chara` and `ccv3` chunks are rewritten with the repaired JSON.
+- **Preserves everything else**, including unknown extension metadata such as `extensions.gallery_id` / `fav` and `_meta`, by mutating the decoded card in place rather than rebuilding it. Both the `chara` and `ccv3` chunks are rewritten with the resulting JSON.
 
-A card is written back whenever it changed **or** the image shrank — so a repair is never lost even when the image can't be compressed further. `cardsRepaired` in the result counts how many cards were changed. Progress uses its own `data/{user}/.repair_state.json` (independent of image compression), so a card already compressed by `/compress` in an older combined run isn't skipped before it can be repaired.
+A card is written back whenever its tags changed, it was repaired, **or** the image shrank — so no change is ever lost even when the image can't be compressed further. `cardsRepaired` counts cards whose JSON was repaired; `tagsChanged` counts cards whose tags were rewritten.
+
+**Request body:**
+
+```ts
+{
+    user: string;            // folder name under data/
+    dictionary?: {           // omit for repair-only (no tag merge)
+        mapping: Record<string, string[]>;  // canonical -> variants
+        removedTags: string[];              // tags to delete from every card
+    };
+}
+```
+
+Progress uses its own `data/{user}/.repair_state.json` (independent of image compression), which also records a hash of the dictionary it was built under. **If the dictionary changes between runs, the size-based skips are dropped** so the new dictionary is re-applied to every card — you don't need to reprocess manually after editing the dictionary.
 
 ```bash
-curl -X POST http://localhost:8000/api/plugins/character-tools/upgrade-characters \
+curl -X POST http://localhost:8000/api/plugins/character-tools/fix-characters \
   -H "Content-Type: application/json" \
-  -d '{"user": "default-user"}'
+  -d '{"user": "default-user", "dictionary": {"mapping": {"Female": ["girl", "woman"]}, "removedTags": ["anypov"]}}'
 ```
 
 ### Reprocess characters
 
 `POST /api/plugins/character-tools/reprocess-characters`
 
-Deletes the `.repair_state.json` state file, then re-runs `/upgrade-characters` on every card from scratch. Use this after a repair-logic update or to re-check previously processed cards.
+Deletes the `.repair_state.json` state file, then re-runs the character pass on every card from scratch. Accepts the same optional `dictionary` body as `/fix-characters`. Use this after a repair-logic update or to force a re-check of previously processed cards.
 
 ```bash
 curl -X POST http://localhost:8000/api/plugins/character-tools/reprocess-characters \

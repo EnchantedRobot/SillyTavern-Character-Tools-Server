@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Chunk } from './transforms';
+import { mergeCardTags, type TagDictionary } from './tagMerge';
 
 // The card JSON is stored identically in both PNG tEXt chunks; we update both.
 const CARD_KEYWORDS = new Set(['chara', 'ccv3']);
@@ -231,19 +232,25 @@ export interface ChunkRepairResult {
     chunks: Chunk[];
     /** True if a chara/ccv3 card chunk was found and decoded. */
     found: boolean;
-    /** True if the repaired card differs from the original. */
+    /** True if the processed card differs from the original (tags and/or repair). */
     changed: boolean;
+    /** True if the repair step (V3 upgrade / token fixes / backfill) changed the card. */
+    repaired: boolean;
+    /** True if the tag dictionary changed the card's tags. */
+    tagsChanged: boolean;
     /** Human-readable descriptions of every change made. */
     changes: string[];
 }
 
 /**
  * Given a PNG's text chunks, locate the character card (preferring ccv3 over
- * chara), repair it, and return an updated text-chunk list with every card
- * chunk re-encoded to the repaired JSON. Non-card text chunks pass through
- * untouched. When no card is found the chunks are returned unchanged.
+ * chara) and run it through the card-processing pass: apply the tag dictionary
+ * (when provided) then repair/upgrade it. Returns an updated text-chunk list
+ * with every card chunk re-encoded to the resulting JSON. Non-card text chunks
+ * pass through untouched. When no card is found the chunks are returned
+ * unchanged. Future card transforms slot in alongside merge + repair here.
  */
-export function repairCardChunks(textChunks: Chunk[]): ChunkRepairResult {
+export function repairCardChunks(textChunks: Chunk[], dictionary?: TagDictionary): ChunkRepairResult {
     // Locate the card, preferring ccv3 (the newer, authoritative chunk).
     let card: Card | null = null;
     for (const keyword of ['ccv3', 'chara']) {
@@ -262,15 +269,28 @@ export function repairCardChunks(textChunks: Chunk[]): ChunkRepairResult {
     }
 
     if (!card) {
-        return { chunks: textChunks, found: false, changed: false, changes: [] };
+        return { chunks: textChunks, found: false, changed: false, repaired: false, tagsChanged: false, changes: [] };
     }
 
     const before = JSON.stringify(card);
-    const { changes } = repairCard(card);
+    const changes: string[] = [];
+
+    // 1. Tag dictionary (extension-owned, passed in per-run). 2. Card repair.
+    let tagsChanged = false;
+    if (dictionary) {
+        const merged = mergeCardTags(card, dictionary);
+        tagsChanged = merged.changed;
+        changes.push(...merged.changes);
+    }
+
+    const repair = repairCard(card);
+    const repaired = repair.changes.length > 0;
+    changes.push(...repair.changes);
+
     const changed = JSON.stringify(card) !== before;
 
     if (!changed) {
-        return { chunks: textChunks, found: true, changed: false, changes };
+        return { chunks: textChunks, found: true, changed: false, repaired, tagsChanged, changes };
     }
 
     // Re-encode every existing card chunk (chara and/or ccv3) with the repaired
@@ -284,5 +304,5 @@ export function repairCardChunks(textChunks: Chunk[]): ChunkRepairResult {
         return chunk;
     });
 
-    return { chunks: rewritten, found: true, changed: true, changes };
+    return { chunks: rewritten, found: true, changed: true, repaired, tagsChanged, changes };
 }

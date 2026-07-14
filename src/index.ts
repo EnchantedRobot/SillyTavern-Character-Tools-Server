@@ -18,6 +18,7 @@ import {
     stateKey,
 } from './transforms';
 import { repairCardChunks } from './cardRepair';
+import { dictionaryHash, type TagDictionary } from './tagMerge';
 
 const execFileAsync = promisify(execFile);
 // pngquant-bin is a CommonJS module exporting the binary path; require keeps the interop simple
@@ -46,6 +47,8 @@ interface CompressionResult {
     filesCompressed: number;
     /** Character cards whose embedded JSON was upgraded/repaired (character flow only). */
     cardsRepaired: number;
+    /** Character cards whose tags were rewritten by the dictionary (character flow only). */
+    tagsChanged: number;
     bytesSaved: number;
     errors: string[];
 }
@@ -56,6 +59,7 @@ function emptyResult(filesScanned: number): CompressionResult {
         filesSkipped: 0,
         filesCompressed: 0,
         cardsRepaired: 0,
+        tagsChanged: 0,
         bytesSaved: 0,
         errors: [],
     };
@@ -83,6 +87,30 @@ function loadState(stateFile: string): State {
 
 function saveState(stateFile: string, state: State): void {
     fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
+// The character state additionally records the dictionary hash it was built
+// under, so a dictionary edit invalidates the size-skips (see runCharacterUpgrade).
+interface CharacterState {
+    dictHash: string | null;
+    files: State;
+}
+
+function loadCharacterState(stateFile: string): CharacterState {
+    try {
+        const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        if (raw && typeof raw === 'object' && raw.files && typeof raw.files === 'object') {
+            return { dictHash: typeof raw.dictHash === 'string' ? raw.dictHash : null, files: raw.files as State };
+        }
+        // Legacy flat shape ({ "relpath": { size } }) from before dict tracking.
+        return { dictHash: null, files: (raw && typeof raw === 'object' ? raw : {}) as State };
+    } catch {
+        return { dictHash: null, files: {} };
+    }
+}
+
+function saveCharacterState(stateFile: string, dictHash: string, files: State): void {
+    fs.writeFileSync(stateFile, JSON.stringify({ dictHash, files }, null, 2));
 }
 
 function alreadyProcessed(filePath: string, userDir: string, state: State): boolean {
@@ -352,12 +380,13 @@ async function repairAndCompressCharacter(
     maxDimension: number,
     minDimension: number,
     result: CompressionResult,
+    dictionary?: TagDictionary,
 ): Promise<void> {
     const originalData = await fs.promises.readFile(filePath);
     const originalSize = originalData.length;
 
     const textChunks = extractTextChunks(originalData);
-    const repair = repairCardChunks(textChunks);
+    const repair = repairCardChunks(textChunks, dictionary);
 
     const { imageBytes, resized } = await optimizePngImage(filePath, originalData, maxDimension, minDimension);
     const baseImage = imageBytes ?? originalData;
@@ -372,8 +401,9 @@ async function repairAndCompressCharacter(
 
     await fs.promises.writeFile(filePath, candidateData);
 
+    if (repair.repaired) result.cardsRepaired++;
+    if (repair.tagsChanged) result.tagsChanged++;
     if (repair.changed) {
-        result.cardsRepaired++;
         console.log(chalk.green(MODULE_NAME), `CARD ${path.basename(filePath)}: ${repair.changes.join('; ')}`);
     }
     const saved = originalSize - newSize;
@@ -479,6 +509,32 @@ function resolveUserDir(user: string): { userDir: string; status: number; error?
     return { userDir, status: 200 };
 }
 
+/**
+ * Pull an optional tag dictionary out of a request body. Returns undefined when
+ * absent or empty, so the character pass runs as repair-only. Shapes are
+ * validated defensively since this comes straight off the wire.
+ */
+function parseDictionary(body: unknown): TagDictionary | undefined {
+    const d = (body as { dictionary?: unknown })?.dictionary;
+    if (!d || typeof d !== 'object') return undefined;
+    const src = d as { mapping?: unknown; removedTags?: unknown };
+
+    const mapping: Record<string, string[]> = {};
+    if (src.mapping && typeof src.mapping === 'object') {
+        for (const [canonical, variants] of Object.entries(src.mapping as Record<string, unknown>)) {
+            if (Array.isArray(variants)) {
+                mapping[canonical] = variants.filter((v): v is string => typeof v === 'string');
+            }
+        }
+    }
+    const removedTags = Array.isArray(src.removedTags)
+        ? src.removedTags.filter((t): t is string => typeof t === 'string')
+        : [];
+
+    if (Object.keys(mapping).length === 0 && removedTags.length === 0) return undefined;
+    return { mapping, removedTags };
+}
+
 async function collectTasks(
     dir: string,
     opts: { preserveMetadata: boolean; allowWebp: boolean; repair: boolean },
@@ -518,13 +574,13 @@ function buildCharacterTaskList(userDir: string): Promise<FileTask[]> {
     });
 }
 
-async function processTask(task: FileTask, result: CompressionResult): Promise<void> {
+async function processTask(task: FileTask, result: CompressionResult, dictionary?: TagDictionary): Promise<void> {
     if (task.type === 'webp') {
         await compressWebp(task.filePath, task.maxDim, task.minDim, result);
         return;
     }
     if (task.repair && task.type === 'png') {
-        await repairAndCompressCharacter(task.filePath, task.maxDim, task.minDim, result);
+        await repairAndCompressCharacter(task.filePath, task.maxDim, task.minDim, result, dictionary);
         return;
     }
     const converted = task.allowWebp && (await tryConvertToWebp(task.filePath, task.maxDim, task.minDim, result));
@@ -538,11 +594,12 @@ async function processTask(task: FileTask, result: CompressionResult): Promise<v
 
 async function runTasks(
     userDir: string,
-    stateFile: string,
+    files: State,
+    persist: () => void,
     tasks: FileTask[],
     onProgress?: ProgressSender,
+    dictionary?: TagDictionary,
 ): Promise<CompressionResult> {
-    const state = loadState(stateFile);
     const total = tasks.length;
     const result = emptyResult(total);
 
@@ -552,20 +609,20 @@ async function runTasks(
     for (const task of tasks) {
         current++;
 
-        if (alreadyProcessed(task.filePath, userDir, state)) {
+        if (alreadyProcessed(task.filePath, userDir, files)) {
             result.filesSkipped++;
         } else {
             try {
-                await processTask(task, result);
+                await processTask(task, result, dictionary);
             } catch (err) {
                 const msg = `${task.type.toUpperCase()} error ${path.basename(task.filePath)}: ${err}`;
                 result.errors.push(msg);
                 console.error(chalk.red(MODULE_NAME), msg);
             }
-            recordProcessed(task.filePath, userDir, state);
+            recordProcessed(task.filePath, userDir, files);
             stateSaveCounter++;
             if (stateSaveCounter % STATE_SAVE_INTERVAL === 0) {
-                saveState(stateFile, state);
+                persist();
             }
         }
 
@@ -574,11 +631,11 @@ async function runTasks(
         }
     }
 
-    saveState(stateFile, state);
+    persist();
 
     console.log(
         chalk.green(MODULE_NAME),
-        `Done — scanned: ${result.filesScanned}, skipped: ${result.filesSkipped}, compressed: ${result.filesCompressed}, repaired: ${result.cardsRepaired}, saved: ${formatBytes(result.bytesSaved)}`,
+        `Done — scanned: ${result.filesScanned}, skipped: ${result.filesSkipped}, compressed: ${result.filesCompressed}, repaired: ${result.cardsRepaired}, tags: ${result.tagsChanged}, saved: ${formatBytes(result.bytesSaved)}`,
     );
 
     return result;
@@ -587,13 +644,30 @@ async function runTasks(
 /** Compress `user/images/` only. */
 async function runImageCompression(userDir: string, onProgress?: ProgressSender): Promise<CompressionResult> {
     const stateFile = path.join(userDir, STATE_FILENAME);
-    return runTasks(userDir, stateFile, await buildImageTaskList(userDir), onProgress);
+    const files = loadState(stateFile);
+    return runTasks(userDir, files, () => saveState(stateFile, files), await buildImageTaskList(userDir), onProgress);
 }
 
-/** Upgrade + repair + compress `characters/`. */
-async function runCharacterUpgrade(userDir: string, onProgress?: ProgressSender): Promise<CompressionResult> {
+/**
+ * Merge tags + repair + compress `characters/`. The dictionary is passed in by
+ * the caller (extension-owned). Its hash is stored in the state file: if it
+ * differs from the last run's, the size-skips are dropped so the changed
+ * dictionary is re-applied to every card.
+ */
+async function runCharacterUpgrade(
+    userDir: string,
+    dictionary?: TagDictionary,
+    onProgress?: ProgressSender,
+): Promise<CompressionResult> {
     const stateFile = path.join(userDir, REPAIR_STATE_FILENAME);
-    return runTasks(userDir, stateFile, await buildCharacterTaskList(userDir), onProgress);
+    const hash = dictionaryHash(dictionary);
+    const loaded = loadCharacterState(stateFile);
+    const files = loaded.dictHash === hash ? loaded.files : {};
+    if (loaded.dictHash !== hash && loaded.dictHash !== null) {
+        console.log(chalk.yellow(MODULE_NAME), 'Tag dictionary changed — reprocessing all characters');
+    }
+    const persist = () => saveCharacterState(stateFile, hash, files);
+    return runTasks(userDir, files, persist, await buildCharacterTaskList(userDir), onProgress, dictionary);
 }
 
 function startSse(res: import('express').Response): (data: object) => void {
@@ -670,7 +744,7 @@ export async function init(router: Router): Promise<void> {
         }
     }
 
-    // Compress user/images/ only. Character cards are handled by /upgrade-characters.
+    // Compress user/images/ only. Character cards are handled by /fix-characters.
     router.post('/compress', jsonParser, async (req, res) => {
         const user = String(req.body?.user ?? '').trim();
         const { userDir, status, error } = resolveUserDir(user);
@@ -686,21 +760,25 @@ export async function init(router: Router): Promise<void> {
         return streamJob(res, (onProgress) => runImageCompression(userDir, onProgress));
     });
 
-    // Upgrade + repair + compress characters/. Fixes broken tokens, upgrades V2
-    // cards to V3, and preserves all extension metadata.
-    router.post('/upgrade-characters', jsonParser, async (req, res) => {
+    // The combined character pass: merge tags (from the posted dictionary),
+    // repair/upgrade the card (V2→V3, token fixes, backfill), and compress the
+    // image — one decode/write per card. The dictionary is optional; without it
+    // this is repair-only.
+    router.post('/fix-characters', jsonParser, async (req, res) => {
         const user = String(req.body?.user ?? '').trim();
         const { userDir, status, error } = resolveUserDir(user);
         if (error) return res.status(status).json({ error });
-        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, onProgress));
+        const dictionary = parseDictionary(req.body);
+        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, dictionary, onProgress));
     });
 
     router.post('/reprocess-characters', jsonParser, async (req, res) => {
         const user = String(req.body?.user ?? '').trim();
         const { userDir, status, error } = resolveUserDir(user);
         if (error) return res.status(status).json({ error });
+        const dictionary = parseDictionary(req.body);
         await clearState(userDir, REPAIR_STATE_FILENAME, user);
-        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, onProgress));
+        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, dictionary, onProgress));
     });
 
     console.log(chalk.green(MODULE_NAME), 'Plugin loaded!');
