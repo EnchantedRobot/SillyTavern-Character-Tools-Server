@@ -42,9 +42,16 @@ export function norm(t: string): string {
 
 /**
  * Apply a dictionary to a tag list. Every variant (and any tag whose normalized
- * form equals a canonical) is rewritten to its canonical; every removed tag is
- * dropped; the result is deduped case-insensitively with original order kept.
- * Returns the new list and whether anything changed.
+ * form equals a canonical) is rewritten to its canonical; a tag no canonical
+ * claims is dropped when it's in the removed list; the result is deduped
+ * case-insensitively with original order kept. Returns the new list and whether
+ * anything changed.
+ *
+ * Mapping wins over removal: if a tag is claimed by a canonical/variant AND also
+ * appears in removedTags (a contradictory dictionary), it is mapped, not deleted.
+ * This keeps re-runs idempotent — a canonical the merge just produced is claimed
+ * by itself, so it survives the next run — and matches the editor's buildBuckets
+ * precedence ("mapping is the more specific intent").
  */
 export function mergeTags(currentTags: string[], dict: TagDictionary): { tags: string[]; changed: boolean } {
     // Normalized variant/canonical -> canonical (canonical maps to itself so a
@@ -62,8 +69,10 @@ export function mergeTags(currentTags: string[], dict: TagDictionary): { tags: s
 
     for (const tag of currentTags) {
         const key = norm(tag);
-        if (removed.has(key)) { changed = true; continue; } // junk — drop it
-        const out = variantToCanonical.get(key) ?? tag;
+        const mapped = variantToCanonical.get(key);
+        // Removal only applies to tags no canonical claims (mapping wins).
+        if (mapped === undefined && removed.has(key)) { changed = true; continue; } // junk — drop it
+        const out = mapped ?? tag;
         if (out !== tag) changed = true;
         const outKey = norm(out);
         if (seen.has(outKey)) { changed = true; continue; } // dropped a dupe

@@ -16,8 +16,14 @@
 //       · {{Char}}/{{USER}} (any case)         → {{char}}/{{user}}
 //       · {{sub}} {{pos}} {{obj}} {{poss}}
 //         {{poss_p}} {{ref}} (+ single-bracket) → {{user}}
+//   - Heal the `fav` flag when write paths (e.g. ST's /edit-attribute, other
+//     extensions) leave it malformed: coerce string booleans to real booleans,
+//     drop the orphan data.fav that /edit-attribute mis-writes, and mirror the
+//     canonical data.extensions.fav onto the legacy top-level fav. ST treats
+//     data.extensions.fav as authoritative on load (readFromV2) and logs a
+//     "Spec v2 data mismatch" warning when the two disagree.
 //   - Preserve ALL other data, including unknown extension metadata
-//     (extensions.gallery_id / fav, _meta, addon fields, …) by mutating the
+//     (extensions.gallery_id, _meta, addon fields, …) by mutating the
 //     decoded card in place rather than rebuilding it.
 //
 // mes_example is intentionally left untouched.
@@ -117,6 +123,64 @@ function ensureV3Fields(card: Card, changes: string[]): void {
         if (patched > 0) {
             changes.push(`character_book: added use_regex=false to ${patched} entr${patched === 1 ? 'y' : 'ies'}`);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Favorite flag normalisation
+//
+// The `fav` flag lives in two places on a V2/V3 card: the canonical
+// data.extensions.fav and the legacy top-level mirror card.fav. SillyTavern
+// treats data.extensions.fav as authoritative on load and logs a noisy
+// "Spec v2 data mismatch" warning whenever the mirror disagrees. Several write
+// paths update only one location — ST's /edit-attribute even mis-writes a
+// data.fav that violates the spec — and some store the value as the string
+// "true"/"false". We heal to match ST's own resolution: nested wins.
+// ---------------------------------------------------------------------------
+
+/** Coerce ST's occasional string booleans to real booleans; pass anything else through. */
+function coerceFav(value: unknown): unknown {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+}
+
+function normalizeFav(card: Card, changes: string[]): void {
+    const data = card.data;
+    if (typeof data !== 'object' || data === null) return;
+
+    // Remove the spec-violating orphan data.fav that /edit-attribute mis-writes;
+    // the canonical location is data.extensions.fav.
+    if ('fav' in data) {
+        delete data.fav;
+        changes.push('data.fav: removed (orphan; canonical field is data.extensions.fav)');
+    }
+
+    const ext = data.extensions;
+    const hasNested = !!ext && typeof ext === 'object' && 'fav' in ext;
+
+    // Coerce the canonical nested value to a real boolean.
+    if (hasNested) {
+        const coerced = coerceFav(ext.fav);
+        if (coerced !== ext.fav) {
+            ext.fav = coerced;
+            changes.push(`data.extensions.fav: coerced to boolean (${coerced})`);
+        }
+    }
+
+    // Nothing to mirror onto when there's no top-level fav.
+    if (card.fav === undefined) return;
+
+    // data.extensions.fav wins (matches ST's readFromV2); with no canonical
+    // value present, just fix the top-level mirror's own type.
+    const desired = hasNested ? ext.fav : coerceFav(card.fav);
+    if (card.fav !== desired) {
+        card.fav = desired;
+        changes.push(
+            hasNested
+                ? `fav: synced top-level to data.extensions.fav (${desired})`
+                : `fav: coerced top-level to boolean (${desired})`,
+        );
     }
 }
 
@@ -223,6 +287,7 @@ export function repairCard(card: Card): CardRepairResult {
     const changes: string[] = [];
     upgradeV2toV3(card, changes);
     ensureV3Fields(card, changes);
+    normalizeFav(card, changes);
     normalizeTokens(card, changes);
     return { card, changes };
 }

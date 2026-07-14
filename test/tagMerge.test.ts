@@ -76,6 +76,39 @@ describe('mergeTags', () => {
         expect(tags).toEqual(['dragons', 'space opera']);
         expect(changed).toBe(false);
     });
+
+    // A dictionary can contradict itself: a tag listed as a canonical (things map
+    // INTO it) while ALSO sitting in the removed list. Mapping must win, or the
+    // merge deletes a canonical it just produced and re-runs aren't idempotent.
+    describe('mapping wins over removal (idempotency)', () => {
+        const contradictory: TagDictionary = {
+            mapping: { 'Forced Proximity': ['sharingabed'] },
+            removedTags: ['forced proximity'],
+        };
+
+        it('keeps a canonical even when it also appears in removedTags', () => {
+            const { tags } = mergeTags(['Forced Proximity'], contradictory);
+            expect(tags).toEqual(['Forced Proximity']);
+        });
+
+        it('maps a variant to its canonical rather than removing it', () => {
+            const { tags } = mergeTags(['#sharingabed'], contradictory);
+            expect(tags).toEqual(['Forced Proximity']);
+        });
+
+        it('is idempotent: re-applying the merged output changes nothing', () => {
+            const once = mergeTags(['#sharingabed', 'girl'], contradictory).tags;
+            const twice = mergeTags(once, contradictory);
+            expect(twice.tags).toEqual(once);
+            expect(twice.changed).toBe(false);
+        });
+
+        it('still drops a removed tag that no canonical claims', () => {
+            const { tags, changed } = mergeTags(['forced proximity', 'oc'], dict);
+            expect(tags).toEqual(['forced proximity']); // not in `dict`'s mapping, and 'oc' is removed
+            expect(changed).toBe(true);
+        });
+    });
 });
 
 describe('mergeCardTags', () => {
