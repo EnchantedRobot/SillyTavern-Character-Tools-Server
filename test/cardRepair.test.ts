@@ -112,6 +112,58 @@ describe('repairCard — token normalisation', () => {
     });
 });
 
+describe('repairCard — fav normalisation', () => {
+    it('syncs the top-level fav down to the canonical data.extensions.fav (nested wins)', () => {
+        const card = v3Card({ extensions: { fav: false } });
+        card.fav = true; // the mismatch ST warns about
+        const { changes } = repairCard(card);
+        expect(card.fav).toBe(false);
+        expect((card.data as Record<string, any>).extensions.fav).toBe(false);
+        expect(changes.some(c => c.includes('synced top-level to data.extensions.fav'))).toBe(true);
+    });
+
+    it('coerces string booleans and resolves the mismatch to the nested value', () => {
+        const card = v3Card({ extensions: { fav: 'false' } });
+        card.fav = 'true';
+        repairCard(card);
+        expect((card.data as Record<string, any>).extensions.fav).toBe(false);
+        expect(card.fav).toBe(false);
+    });
+
+    it('removes the orphan data.fav that /edit-attribute mis-writes', () => {
+        const card = v3Card({ fav: true, extensions: { fav: true } });
+        card.fav = true;
+        const { changes } = repairCard(card);
+        expect('fav' in (card.data as Record<string, any>)).toBe(false);
+        expect(changes.some(c => c.includes('data.fav: removed'))).toBe(true);
+        // consistent values are left in place
+        expect(card.fav).toBe(true);
+        expect((card.data as Record<string, any>).extensions.fav).toBe(true);
+    });
+
+    it('coerces a lone top-level string fav when there is no nested value', () => {
+        const card = v3Card();
+        card.fav = 'true';
+        repairCard(card);
+        expect(card.fav).toBe(true);
+    });
+
+    it('leaves a consistent fav untouched (no reported change)', () => {
+        const card = v3Card({ extensions: { fav: true } });
+        card.fav = true;
+        const { changes } = repairCard(card);
+        expect(changes).toEqual([]);
+        expect(card.fav).toBe(true);
+    });
+
+    it('does not add a top-level fav when only the nested value exists', () => {
+        const card = v3Card({ extensions: { fav: true } });
+        const { changes } = repairCard(card);
+        expect('fav' in card).toBe(false);
+        expect(changes).toEqual([]);
+    });
+});
+
 describe('repairCard — metadata preservation', () => {
     it('preserves extension metadata and _meta untouched', () => {
         const card = v3Card({
