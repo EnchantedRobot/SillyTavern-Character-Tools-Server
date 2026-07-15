@@ -17,7 +17,7 @@ import {
     formatBytes,
     stateKey,
 } from './transforms';
-import { repairCardChunks } from './cardRepair';
+import { repairCardChunks, readCardTags } from './cardRepair';
 import { dictionaryHash, type TagDictionary } from './tagMerge';
 
 const execFileAsync = promisify(execFile);
@@ -135,7 +135,7 @@ function recordProcessed(filePath: string, userDir: string, state: State): void 
 // File collection
 // ---------------------------------------------------------------------------
 
-async function collectFiles(root: string): Promise<{ pngs: string[]; jpgs: string[]; webps: string[] }> {
+async function collectFiles(root: string, recursive = true): Promise<{ pngs: string[]; jpgs: string[]; webps: string[] }> {
     const pngs: string[] = [];
     const jpgs: string[] = [];
     const webps: string[] = [];
@@ -153,7 +153,7 @@ async function collectFiles(root: string): Promise<{ pngs: string[]; jpgs: strin
         for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
             const fullPath = path.join(dir, entry.name);
             if (entry.isDirectory()) {
-                await walk(fullPath);
+                if (recursive) await walk(fullPath);
             } else if (entry.isFile()) {
                 const ext = path.extname(entry.name).toLowerCase();
                 if (PNG_EXTS.has(ext)) pngs.push(fullPath);
@@ -537,19 +537,24 @@ function parseDictionary(body: unknown): TagDictionary | undefined {
 
 async function collectTasks(
     dir: string,
-    opts: { preserveMetadata: boolean; allowWebp: boolean; repair: boolean },
+    opts: { preserveMetadata: boolean; allowWebp: boolean; repair: boolean; recursive?: boolean; pngOnly?: boolean },
 ): Promise<FileTask[]> {
     if (!fs.existsSync(dir)) {
         console.log(chalk.yellow(MODULE_NAME), `Skipping missing directory: ${dir}`);
         return [];
     }
-    const base = { maxDim: DEFAULT_MAX_DIM, minDim: DEFAULT_MIN_DIM, ...opts };
-    const { pngs, jpgs, webps } = await collectFiles(dir);
-    return [
-        ...pngs.map((f): FileTask => ({ filePath: f, type: 'png', ...base })),
+    const { recursive = true, pngOnly = false, ...taskOpts } = opts;
+    const base = { maxDim: DEFAULT_MAX_DIM, minDim: DEFAULT_MIN_DIM, ...taskOpts };
+    const { pngs, jpgs, webps } = await collectFiles(dir, recursive);
+    const tasks: FileTask[] = pngs.map((f): FileTask => ({ filePath: f, type: 'png', ...base }));
+    // Character cards are always PNG (the card JSON lives in a PNG text chunk), so
+    // a jpg/webp here can't be a card and there's nothing to repair or convert.
+    if (pngOnly) return tasks;
+    tasks.push(
         ...jpgs.map((f): FileTask => ({ filePath: f, type: 'jpg', ...base })),
         ...webps.map((f): FileTask => ({ filePath: f, type: 'webp', ...base })),
-    ];
+    );
+    return tasks;
 }
 
 /** `user/images/` — plain compression with WEBP conversion, no metadata to keep. */
@@ -565,12 +570,22 @@ function buildImageTaskList(userDir: string): Promise<FileTask[]> {
  * `characters/` — cards embed their JSON in PNG text chunks (which WEBP has no
  * equivalent for), so we never convert to WEBP; PNGs are repaired/upgraded and
  * their metadata preserved.
+ *
+ * A character card is always a PNG, so the pass is PNG-only — a jpg/webp here
+ * can't be a card and is left untouched.
+ *
+ * Only files at the ROOT of `characters/` are cards. SillyTavern stores a
+ * character's expression sprites in a subfolder named after it
+ * (`characters/<Name>/happy.png`, …); those are not cards, so we don't recurse
+ * and never try to repair them.
  */
 function buildCharacterTaskList(userDir: string): Promise<FileTask[]> {
     return collectTasks(path.join(userDir, ...CHARACTERS_SUBDIR), {
         preserveMetadata: true,
         allowWebp: false,
         repair: true,
+        recursive: false,
+        pngOnly: true,
     });
 }
 
@@ -720,6 +735,34 @@ export async function init(router: Router): Promise<void> {
         ]);
 
         return res.json({ images, characters });
+    });
+
+    // Read-only survey of a user's character tags, so the extension's dictionary
+    // editor can bucket the SELECTED user's cards (the browser only has the
+    // logged-in user's list). Same scope as the character pass: root-level PNGs
+    // only. Returns lightweight { avatar, tags } objects the editor feeds
+    // straight into buildBuckets. Cards with no tags are omitted.
+    router.post('/character-tags', jsonParser, async (req, res) => {
+        const user = String(req.body?.user ?? '').trim();
+        const { userDir, status, error } = resolveUserDir(user);
+        if (error) return res.status(status).json({ error });
+
+        try {
+            const { pngs } = await collectFiles(path.join(userDir, ...CHARACTERS_SUBDIR), false);
+            const characters: { avatar: string; tags: string[] }[] = [];
+            for (const filePath of pngs) {
+                try {
+                    const tags = readCardTags(extractTextChunks(await fs.promises.readFile(filePath)));
+                    if (tags.length > 0) characters.push({ avatar: path.basename(filePath), tags });
+                } catch {
+                    // unreadable/corrupt card — skip it, don't fail the whole survey
+                }
+            }
+            return res.json({ characters });
+        } catch (err) {
+            console.error(chalk.red(MODULE_NAME), 'Failed to read character tags', err);
+            return res.status(500).json({ error: 'Could not read character tags' });
+        }
     });
 
     // Stream a compression/repair job to the client over SSE.

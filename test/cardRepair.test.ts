@@ -5,6 +5,8 @@ import {
     decodeCard,
     encodeCardChunk,
     repairCardChunks,
+    locateCard,
+    readCardTags,
 } from '../src/cardRepair';
 import type { Chunk } from '../src/transforms';
 
@@ -264,5 +266,47 @@ describe('repairCardChunks', () => {
         expect(result.tagsChanged).toBe(true);
         expect(result.repaired).toBe(false);
         expect(result.changed).toBe(true);
+    });
+});
+
+describe('locateCard', () => {
+    it('prefers the ccv3 chunk over the legacy chara chunk', () => {
+        const chunks = [
+            cardChunk('chara', v3Card({ name: 'old' })),
+            cardChunk('ccv3', v3Card({ name: 'new' })),
+        ];
+        const card = locateCard(chunks) as Record<string, any>;
+        expect(card?.data.name).toBe('new');
+    });
+
+    it('falls back to chara when there is no ccv3 chunk', () => {
+        const card = locateCard([cardChunk('chara', v3Card({ name: 'only' }))]) as Record<string, any>;
+        expect(card?.data.name).toBe('only');
+    });
+
+    it('returns null when no chunk holds a valid card', () => {
+        expect(locateCard([])).toBeNull();
+        expect(locateCard([{ type: 'tEXt', data: Buffer.from('foo\0not-base64-json', 'latin1') }])).toBeNull();
+    });
+});
+
+describe('readCardTags', () => {
+    it('reads data.tags from the located card', () => {
+        expect(readCardTags([cardChunk('ccv3', v3Card({ tags: ['Female', 'Romance'] }))]))
+            .toEqual(['Female', 'Romance']);
+    });
+
+    it('drops non-string and blank/whitespace tags', () => {
+        const card = { data: { tags: ['a', '', '  ', 3, null, 'b'] } };
+        expect(readCardTags([cardChunk('chara', card)])).toEqual(['a', 'b']);
+    });
+
+    it('falls back to a root-level tags mirror', () => {
+        expect(readCardTags([cardChunk('ccv3', { tags: ['x', 'y'] })])).toEqual(['x', 'y']);
+    });
+
+    it('returns [] when there is no card or no tags', () => {
+        expect(readCardTags([])).toEqual([]);
+        expect(readCardTags([cardChunk('ccv3', v3Card())])).toEqual([]);
     });
 });

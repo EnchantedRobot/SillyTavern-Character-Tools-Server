@@ -19,7 +19,7 @@ export interface Chunk {
 export type ImageKind = 'png' | 'jpg' | 'gif' | 'webp' | 'other';
 
 // ---------------------------------------------------------------------------
-// PNG chunk helpers (mirrors compress.py)
+// PNG chunk helpers
 // ---------------------------------------------------------------------------
 
 export function crc32(data: Buffer): number {
