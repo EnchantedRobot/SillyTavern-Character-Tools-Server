@@ -5,6 +5,7 @@ import {
     decodeCard,
     encodeCardChunk,
     repairCardChunks,
+    mergeTagChunks,
     locateCard,
     readCardTags,
 } from '../src/cardRepair';
@@ -13,6 +14,12 @@ import type { Chunk } from '../src/transforms';
 // Build a tEXt chunk carrying a base64-encoded card, exactly as SillyTavern does.
 function cardChunk(keyword: string, card: object): Chunk {
     return encodeCardChunk(keyword, card as Record<string, unknown>);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function decodeCcv3(chunks: Chunk[]): Record<string, any> {
+    const chunk = chunks.find(c => c.data.toString('latin1').startsWith('ccv3\0'))!;
+    return decodeCard(chunk.data.subarray(chunk.data.indexOf(0) + 1)) as Record<string, any>;
 }
 
 function v3Card(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -240,32 +247,64 @@ describe('repairCardChunks', () => {
         const result = repairCardChunks([cardChunk('ccv3', v3Card())]);
         expect(result.found).toBe(true);
         expect(result.changed).toBe(false);
-        expect(result.repaired).toBe(false);
-        expect(result.tagsChanged).toBe(false);
     });
 
-    it('merges tags and repairs in one pass, reporting each independently', () => {
-        const dict = { mapping: { Female: ['girl'] }, removedTags: ['anypov'] };
-        const card = v3Card({ description: 'meet {char}', tags: ['girl', 'anypov', 'dragons'] });
-        const result = repairCardChunks([cardChunk('ccv3', card)], dict);
+    // The whole point of the /fix-characters ÷ /apply-tags split: repair must
+    // leave tags alone, even messy ones a dictionary would collapse.
+    it('never touches tags, even when they are messy', () => {
+        const card = v3Card({ description: 'meet {char}', tags: ['girl', 'girl', 'anypov'] });
+        const result = repairCardChunks([cardChunk('ccv3', card)]);
 
-        expect(result.changed).toBe(true);
-        expect(result.tagsChanged).toBe(true);
-        expect(result.repaired).toBe(true);
-
-        const chunk = result.chunks.find(c => c.data.toString('latin1').startsWith('ccv3\0'))!;
-        const decoded = decodeCard(chunk.data.subarray(chunk.data.indexOf(0) + 1)) as Record<string, any>;
-        expect(decoded.data.tags).toEqual(['Female', 'dragons']);
+        expect(result.changed).toBe(true); // the prose was repaired
+        const decoded = decodeCcv3(result.chunks);
         expect(decoded.data.description).toBe('meet {{char}}');
+        expect(decoded.data.tags).toEqual(['girl', 'girl', 'anypov']);
     });
 
-    it('reports tagsChanged without repaired when only tags change', () => {
-        const dict = { mapping: { Female: ['girl'] }, removedTags: [] };
-        const card = v3Card({ tags: ['girl'] }); // already clean prose/spec
-        const result = repairCardChunks([cardChunk('ccv3', card)], dict);
-        expect(result.tagsChanged).toBe(true);
-        expect(result.repaired).toBe(false);
+    it('leaves a card whose only problem is its tags completely alone', () => {
+        const chunks = [cardChunk('ccv3', v3Card({ tags: ['girl', 'anypov'] }))];
+        const result = repairCardChunks(chunks);
+        expect(result.changed).toBe(false);
+        expect(result.chunks).toBe(chunks);
+    });
+});
+
+describe('mergeTagChunks', () => {
+    const dict = { mapping: { Female: ['girl'] }, removedTags: ['anypov'] };
+
+    it('rewrites the tag array and nothing else', () => {
+        // Broken prose and a V2 spec marker: repair territory, so both must survive untouched.
+        const card = { spec: 'chara_card_v2', spec_version: '2.0', data: { name: 'Alice', description: 'meet {char}', tags: ['girl', 'anypov', 'dragons'] } };
+        const result = mergeTagChunks([cardChunk('ccv3', card)], dict);
+
         expect(result.changed).toBe(true);
+        const decoded = decodeCcv3(result.chunks);
+        expect(decoded.data.tags).toEqual(['Female', 'dragons']);
+        expect(decoded.data.description).toBe('meet {char}');
+        expect(decoded.spec).toBe('chara_card_v2');
+    });
+
+    it('is a no-op when the dictionary changes nothing, so re-runs rewrite nothing', () => {
+        const chunks = [cardChunk('ccv3', v3Card({ tags: ['Female', 'dragons'] }))];
+        const result = mergeTagChunks(chunks, dict);
+        expect(result.changed).toBe(false);
+        expect(result.chunks).toBe(chunks);
+    });
+
+    it('is idempotent — applying twice matches applying once', () => {
+        const card = v3Card({ tags: ['girl', 'anypov', 'dragons'] });
+        const once = mergeTagChunks([cardChunk('ccv3', card)], dict);
+        const twice = mergeTagChunks(once.chunks, dict);
+
+        expect(twice.changed).toBe(false);
+        expect(decodeCcv3(once.chunks).data.tags).toEqual(['Female', 'dragons']);
+    });
+
+    it('leaves chunks untouched when there is no card', () => {
+        const chunks: Chunk[] = [{ type: 'tEXt', data: Buffer.from('Comment\0hi', 'latin1') }];
+        const result = mergeTagChunks(chunks, dict);
+        expect(result.changed).toBe(false);
+        expect(result.chunks).toBe(chunks);
     });
 });
 

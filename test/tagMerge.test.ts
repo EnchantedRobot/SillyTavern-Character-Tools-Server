@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { norm, mergeTags, mergeCardTags, dictionaryHash, type TagDictionary } from '../src/tagMerge';
+import { norm, mergeTags, mergeCardTags, type TagDictionary } from '../src/tagMerge';
 
 const dict: TagDictionary = {
     mapping: {
@@ -136,24 +136,5 @@ describe('mergeCardTags', () => {
         const card: Record<string, any> = { data: { tags: ['dragons'] } };
         expect(mergeCardTags(card, dict).changed).toBe(false);
         expect(card.data.tags).toEqual(['dragons']);
-    });
-});
-
-describe('dictionaryHash', () => {
-    it('is stable regardless of key/variant ordering', () => {
-        const a: TagDictionary = { mapping: { Female: ['girl', 'woman'], Romance: ['love'] }, removedTags: ['oc', 'anypov'] };
-        const b: TagDictionary = { mapping: { Romance: ['love'], Female: ['woman', 'girl'] }, removedTags: ['anypov', 'oc'] };
-        expect(dictionaryHash(a)).toBe(dictionaryHash(b));
-    });
-
-    it('returns "none" for an undefined or empty dictionary', () => {
-        expect(dictionaryHash(undefined)).toBe('none');
-        expect(dictionaryHash({ mapping: {}, removedTags: [] })).toBe('none');
-    });
-
-    it('changes when the content changes', () => {
-        const base = dictionaryHash(dict);
-        expect(dictionaryHash({ ...dict, removedTags: ['anypov'] })).not.toBe(base);
-        expect(dictionaryHash({ mapping: { ...dict.mapping, Female: ['female'] }, removedTags: dict.removedTags })).not.toBe(base);
     });
 });
