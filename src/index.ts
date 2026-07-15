@@ -17,8 +17,8 @@ import {
     formatBytes,
     stateKey,
 } from './transforms';
-import { repairCardChunks, readCardTags } from './cardRepair';
-import { dictionaryHash, type TagDictionary } from './tagMerge';
+import { repairCardChunks, mergeTagChunks, readCardTags } from './cardRepair';
+import { type TagDictionary } from './tagMerge';
 
 const execFileAsync = promisify(execFile);
 // pngquant-bin is a CommonJS module exporting the binary path; require keeps the interop simple
@@ -45,9 +45,9 @@ interface CompressionResult {
     filesScanned: number;
     filesSkipped: number;
     filesCompressed: number;
-    /** Character cards whose embedded JSON was upgraded/repaired (character flow only). */
+    /** Character cards whose embedded JSON was upgraded/repaired (/fix-characters only). */
     cardsRepaired: number;
-    /** Character cards whose tags were rewritten by the dictionary (character flow only). */
+    /** Character cards whose tags were rewritten by the dictionary (/apply-tags only). */
     tagsChanged: number;
     bytesSaved: number;
     errors: string[];
@@ -79,7 +79,14 @@ type State = Record<string, { size: number }>;
 
 function loadState(stateFile: string): State {
     try {
-        return JSON.parse(fs.readFileSync(stateFile, 'utf8')) as State;
+        const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        if (!raw || typeof raw !== 'object') return {};
+        // Older repair states wrapped the file map in { dictHash, files } to track
+        // which tag dictionary the pass ran under. Tags no longer run here, so the
+        // hash is gone — unwrap so those files keep their skips instead of
+        // silently reprocessing the whole library once.
+        if (raw.files && typeof raw.files === 'object') return raw.files as State;
+        return raw as State;
     } catch {
         return {};
     }
@@ -87,30 +94,6 @@ function loadState(stateFile: string): State {
 
 function saveState(stateFile: string, state: State): void {
     fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
-}
-
-// The character state additionally records the dictionary hash it was built
-// under, so a dictionary edit invalidates the size-skips (see runCharacterUpgrade).
-interface CharacterState {
-    dictHash: string | null;
-    files: State;
-}
-
-function loadCharacterState(stateFile: string): CharacterState {
-    try {
-        const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-        if (raw && typeof raw === 'object' && raw.files && typeof raw.files === 'object') {
-            return { dictHash: typeof raw.dictHash === 'string' ? raw.dictHash : null, files: raw.files as State };
-        }
-        // Legacy flat shape ({ "relpath": { size } }) from before dict tracking.
-        return { dictHash: null, files: (raw && typeof raw === 'object' ? raw : {}) as State };
-    } catch {
-        return { dictHash: null, files: {} };
-    }
-}
-
-function saveCharacterState(stateFile: string, dictHash: string, files: State): void {
-    fs.writeFileSync(stateFile, JSON.stringify({ dictHash, files }, null, 2));
 }
 
 function alreadyProcessed(filePath: string, userDir: string, state: State): boolean {
@@ -380,13 +363,12 @@ async function repairAndCompressCharacter(
     maxDimension: number,
     minDimension: number,
     result: CompressionResult,
-    dictionary?: TagDictionary,
 ): Promise<void> {
     const originalData = await fs.promises.readFile(filePath);
     const originalSize = originalData.length;
 
     const textChunks = extractTextChunks(originalData);
-    const repair = repairCardChunks(textChunks, dictionary);
+    const repair = repairCardChunks(textChunks);
 
     const { imageBytes, resized } = await optimizePngImage(filePath, originalData, maxDimension, minDimension);
     const baseImage = imageBytes ?? originalData;
@@ -401,9 +383,8 @@ async function repairAndCompressCharacter(
 
     await fs.promises.writeFile(filePath, candidateData);
 
-    if (repair.repaired) result.cardsRepaired++;
-    if (repair.tagsChanged) result.tagsChanged++;
     if (repair.changed) {
+        result.cardsRepaired++;
         console.log(chalk.green(MODULE_NAME), `CARD ${path.basename(filePath)}: ${repair.changes.join('; ')}`);
     }
     const saved = originalSize - newSize;
@@ -589,13 +570,13 @@ function buildCharacterTaskList(userDir: string): Promise<FileTask[]> {
     });
 }
 
-async function processTask(task: FileTask, result: CompressionResult, dictionary?: TagDictionary): Promise<void> {
+async function processTask(task: FileTask, result: CompressionResult): Promise<void> {
     if (task.type === 'webp') {
         await compressWebp(task.filePath, task.maxDim, task.minDim, result);
         return;
     }
     if (task.repair && task.type === 'png') {
-        await repairAndCompressCharacter(task.filePath, task.maxDim, task.minDim, result, dictionary);
+        await repairAndCompressCharacter(task.filePath, task.maxDim, task.minDim, result);
         return;
     }
     const converted = task.allowWebp && (await tryConvertToWebp(task.filePath, task.maxDim, task.minDim, result));
@@ -613,7 +594,6 @@ async function runTasks(
     persist: () => void,
     tasks: FileTask[],
     onProgress?: ProgressSender,
-    dictionary?: TagDictionary,
 ): Promise<CompressionResult> {
     const total = tasks.length;
     const result = emptyResult(total);
@@ -628,7 +608,7 @@ async function runTasks(
             result.filesSkipped++;
         } else {
             try {
-                await processTask(task, result, dictionary);
+                await processTask(task, result);
             } catch (err) {
                 const msg = `${task.type.toUpperCase()} error ${path.basename(task.filePath)}: ${err}`;
                 result.errors.push(msg);
@@ -663,26 +643,62 @@ async function runImageCompression(userDir: string, onProgress?: ProgressSender)
     return runTasks(userDir, files, () => saveState(stateFile, files), await buildImageTaskList(userDir), onProgress);
 }
 
+/** Repair + compress `characters/`. Never touches tags — that's runTagApply. */
+async function runCharacterUpgrade(userDir: string, onProgress?: ProgressSender): Promise<CompressionResult> {
+    const stateFile = path.join(userDir, REPAIR_STATE_FILENAME);
+    const files = loadState(stateFile);
+    return runTasks(userDir, files, () => saveState(stateFile, files), await buildCharacterTaskList(userDir), onProgress);
+}
+
 /**
- * Merge tags + repair + compress `characters/`. The dictionary is passed in by
- * the caller (extension-owned). Its hash is stored in the state file: if it
- * differs from the last run's, the size-skips are dropped so the changed
- * dictionary is re-applied to every card.
+ * Apply the tag dictionary across `characters/`, and nothing else: no repair,
+ * no image re-encode. Each card's pixel data is carried across byte-for-byte
+ * (injectTextChunks rewrites only the text chunks), so this costs a read and —
+ * for cards the dictionary actually changes — a write.
+ *
+ * There's no state file and no dictionary hash: `mergeTagChunks` reports
+ * whether a card's tags actually changed, which answers "did this card need the
+ * dictionary applied?" directly and correctly. A re-run with an unchanged
+ * dictionary rewrites nothing.
  */
-async function runCharacterUpgrade(
+async function runTagApply(
     userDir: string,
-    dictionary?: TagDictionary,
+    dictionary: TagDictionary,
     onProgress?: ProgressSender,
 ): Promise<CompressionResult> {
-    const stateFile = path.join(userDir, REPAIR_STATE_FILENAME);
-    const hash = dictionaryHash(dictionary);
-    const loaded = loadCharacterState(stateFile);
-    const files = loaded.dictHash === hash ? loaded.files : {};
-    if (loaded.dictHash !== hash && loaded.dictHash !== null) {
-        console.log(chalk.yellow(MODULE_NAME), 'Tag dictionary changed — reprocessing all characters');
+    const { pngs } = await collectFiles(path.join(userDir, ...CHARACTERS_SUBDIR), false);
+    const result = emptyResult(pngs.length);
+
+    let current = 0;
+    for (const filePath of pngs) {
+        current++;
+        try {
+            const originalData = await fs.promises.readFile(filePath);
+            const merged = mergeTagChunks(extractTextChunks(originalData), dictionary);
+            if (merged.changed) {
+                await fs.promises.writeFile(filePath, injectTextChunks(originalData, merged.chunks));
+                result.tagsChanged++;
+                console.log(chalk.green(MODULE_NAME), `TAGS ${path.basename(filePath)}: ${merged.changes.join('; ')}`);
+            } else {
+                result.filesSkipped++;
+            }
+        } catch (err) {
+            const msg = `TAGS error ${path.basename(filePath)}: ${err}`;
+            result.errors.push(msg);
+            console.error(chalk.red(MODULE_NAME), msg);
+        }
+
+        if (current % PROGRESS_INTERVAL === 0 || current === pngs.length) {
+            onProgress?.(current, pngs.length);
+        }
     }
-    const persist = () => saveCharacterState(stateFile, hash, files);
-    return runTasks(userDir, files, persist, await buildCharacterTaskList(userDir), onProgress, dictionary);
+
+    console.log(
+        chalk.green(MODULE_NAME),
+        `Done — scanned: ${result.filesScanned}, unchanged: ${result.filesSkipped}, tags rewritten: ${result.tagsChanged}`,
+    );
+
+    return result;
 }
 
 function startSse(res: import('express').Response): (data: object) => void {
@@ -803,25 +819,33 @@ export async function init(router: Router): Promise<void> {
         return streamJob(res, (onProgress) => runImageCompression(userDir, onProgress));
     });
 
-    // The combined character pass: merge tags (from the posted dictionary),
-    // repair/upgrade the card (V2→V3, token fixes, backfill), and compress the
-    // image — one decode/write per card. The dictionary is optional; without it
-    // this is repair-only.
+    // The character repair pass: repair/upgrade the card (V2→V3, token fixes,
+    // backfill) and compress the image — one decode/write per card. Tags are
+    // never touched here; that's /apply-tags.
     router.post('/fix-characters', jsonParser, async (req, res) => {
         const user = String(req.body?.user ?? '').trim();
         const { userDir, status, error } = resolveUserDir(user);
         if (error) return res.status(status).json({ error });
-        const dictionary = parseDictionary(req.body);
-        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, dictionary, onProgress));
+        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, onProgress));
     });
 
     router.post('/reprocess-characters', jsonParser, async (req, res) => {
         const user = String(req.body?.user ?? '').trim();
         const { userDir, status, error } = resolveUserDir(user);
         if (error) return res.status(status).json({ error });
-        const dictionary = parseDictionary(req.body);
         await clearState(userDir, REPAIR_STATE_FILENAME, user);
-        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, dictionary, onProgress));
+        return streamJob(res, (onProgress) => runCharacterUpgrade(userDir, onProgress));
+    });
+
+    // Apply the extension-owned tag dictionary to a user's cards. Tags only —
+    // no repair, no recompression — so it stays cheap enough to re-run freely.
+    router.post('/apply-tags', jsonParser, async (req, res) => {
+        const user = String(req.body?.user ?? '').trim();
+        const { userDir, status, error } = resolveUserDir(user);
+        if (error) return res.status(status).json({ error });
+        const dictionary = parseDictionary(req.body);
+        if (!dictionary) return res.status(400).json({ error: 'No tag dictionary posted' });
+        return streamJob(res, (onProgress) => runTagApply(userDir, dictionary, onProgress));
     });
 
     console.log(chalk.green(MODULE_NAME), 'Plugin loaded!');

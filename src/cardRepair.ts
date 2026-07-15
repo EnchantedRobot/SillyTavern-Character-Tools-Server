@@ -297,24 +297,12 @@ export interface ChunkRepairResult {
     chunks: Chunk[];
     /** True if a chara/ccv3 card chunk was found and decoded. */
     found: boolean;
-    /** True if the processed card differs from the original (tags and/or repair). */
+    /** True if the repair changed the card. */
     changed: boolean;
-    /** True if the repair step (V3 upgrade / token fixes / backfill) changed the card. */
-    repaired: boolean;
-    /** True if the tag dictionary changed the card's tags. */
-    tagsChanged: boolean;
     /** Human-readable descriptions of every change made. */
     changes: string[];
 }
 
-/**
- * Given a PNG's text chunks, locate the character card (preferring ccv3 over
- * chara) and run it through the card-processing pass: apply the tag dictionary
- * (when provided) then repair/upgrade it. Returns an updated text-chunk list
- * with every card chunk re-encoded to the resulting JSON. Non-card text chunks
- * pass through untouched. When no card is found the chunks are returned
- * unchanged. Future card transforms slot in alongside merge + repair here.
- */
 /**
  * Locate the character card in a PNG's text chunks, preferring the newer,
  * authoritative `ccv3` chunk over the legacy `chara` chunk. Returns the decoded
@@ -348,45 +336,73 @@ export function readCardTags(textChunks: Chunk[]): string[] {
     return tags.filter((t: unknown): t is string => typeof t === 'string' && t.trim() !== '');
 }
 
-export function repairCardChunks(textChunks: Chunk[], dictionary?: TagDictionary): ChunkRepairResult {
+/**
+ * Re-encode every existing card chunk (chara and/or ccv3) with `card`'s JSON;
+ * leave all other text chunks in place.
+ */
+function rewriteCardChunks(textChunks: Chunk[], card: Card): Chunk[] {
+    return textChunks.map((chunk) => {
+        if (chunk.type !== 'tEXt') return chunk;
+        const split = splitTextChunk(chunk.data);
+        if (split && CARD_KEYWORDS.has(split.keyword)) {
+            return encodeCardChunk(split.keyword, card);
+        }
+        return chunk;
+    });
+}
+
+/**
+ * Given a PNG's text chunks, locate the character card (preferring ccv3 over
+ * chara) and repair/upgrade it. Returns an updated text-chunk list with every
+ * card chunk re-encoded to the resulting JSON; non-card text chunks pass
+ * through untouched, and when no card is found the chunks are returned
+ * unchanged.
+ *
+ * Tags are deliberately NOT touched here — merging tags is `mergeTagChunks`,
+ * driven by the separate /apply-tags pass. Keeping the two apart is what lets
+ * each own its own skip/idempotence rules.
+ */
+export function repairCardChunks(textChunks: Chunk[]): ChunkRepairResult {
     // Locate the card, preferring ccv3 (the newer, authoritative chunk).
     const card = locateCard(textChunks);
 
     if (!card) {
-        return { chunks: textChunks, found: false, changed: false, repaired: false, tagsChanged: false, changes: [] };
+        return { chunks: textChunks, found: false, changed: false, changes: [] };
     }
 
     const before = JSON.stringify(card);
-    const changes: string[] = [];
+    const { changes } = repairCard(card);
 
-    // 1. Tag dictionary (extension-owned, passed in per-run). 2. Card repair.
-    let tagsChanged = false;
-    if (dictionary) {
-        const merged = mergeCardTags(card, dictionary);
-        tagsChanged = merged.changed;
-        changes.push(...merged.changes);
+    if (JSON.stringify(card) === before) {
+        return { chunks: textChunks, found: true, changed: false, changes };
     }
 
-    const repair = repairCard(card);
-    const repaired = repair.changes.length > 0;
-    changes.push(...repair.changes);
+    return { chunks: rewriteCardChunks(textChunks, card), found: true, changed: true, changes };
+}
 
-    const changed = JSON.stringify(card) !== before;
+export interface ChunkTagResult {
+    /** The (possibly rewritten) text-chunk list. */
+    chunks: Chunk[];
+    /** True if the dictionary changed the card's tags. */
+    changed: boolean;
+    /** Human-readable descriptions of every change made. */
+    changes: string[];
+}
 
-    if (!changed) {
-        return { chunks: textChunks, found: true, changed: false, repaired, tagsChanged, changes };
-    }
+/**
+ * Apply the tag dictionary to the card in a PNG's text chunks, and nothing
+ * else. Only the card's tag array is touched (see `mergeCardTags`); no repair,
+ * no upgrade, no other field. Returns the chunks unchanged when there's no
+ * card or the dictionary is a no-op for it — which makes the pass idempotent,
+ * so re-applying an unchanged dictionary rewrites nothing and needs no
+ * skip-state to be fast.
+ */
+export function mergeTagChunks(textChunks: Chunk[], dictionary: TagDictionary): ChunkTagResult {
+    const card = locateCard(textChunks);
+    if (!card) return { chunks: textChunks, changed: false, changes: [] };
 
-    // Re-encode every existing card chunk (chara and/or ccv3) with the repaired
-    // JSON; leave all other text chunks in place.
-    const rewritten = textChunks.map((chunk) => {
-        if (chunk.type !== 'tEXt') return chunk;
-        const split = splitTextChunk(chunk.data);
-        if (split && CARD_KEYWORDS.has(split.keyword)) {
-            return encodeCardChunk(split.keyword, card as Card);
-        }
-        return chunk;
-    });
+    const { changed, changes } = mergeCardTags(card, dictionary);
+    if (!changed) return { chunks: textChunks, changed: false, changes };
 
-    return { chunks: rewritten, found: true, changed: true, repaired, tagsChanged, changes };
+    return { chunks: rewriteCardChunks(textChunks, card), changed: true, changes };
 }

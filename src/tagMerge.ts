@@ -14,8 +14,6 @@
 // one place it must change in all of them.
 // ---------------------------------------------------------------------------
 
-import { createHash } from 'node:crypto';
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Card = Record<string, any>;
 
@@ -100,20 +98,4 @@ export function mergeCardTags(card: Card, dict: TagDictionary): { changed: boole
     if (Array.isArray(card.tags)) card.tags = tags; // keep the legacy root mirror consistent
 
     return { changed: true, changes: [`data.tags: applied dictionary (${current.length} → ${tags.length} tags)`] };
-}
-
-/**
- * Deterministic, compact hash of a dictionary's meaningful content (keys and
- * members are sorted so ordering doesn't affect it). Used to invalidate the
- * character state file when the dictionary changes, so edits aren't hidden by
- * the size-skip. Returns 'none' when there's no dictionary to apply.
- */
-export function dictionaryHash(dict?: TagDictionary): string {
-    if (!dict) return 'none';
-    const mapping = dict.mapping ?? {};
-    const keys = Object.keys(mapping);
-    if (keys.length === 0 && (dict.removedTags ?? []).length === 0) return 'none';
-    const canonical = keys.sort().map(k => `${k}=${[...(mapping[k] ?? [])].map(norm).sort().join(',')}`);
-    const removed = [...(dict.removedTags ?? [])].map(norm).sort();
-    return createHash('sha1').update(`${canonical.join('|')}##${removed.join(',')}`).digest('hex');
 }
