@@ -19,6 +19,10 @@ Converted files don't need separate tracking: once a file becomes `.webp` it's n
 
 Each card runs the full pass in a **single decode/write**: tag merge, card repair, then image compression.
 
+The character pass is **PNG-only**: a card embeds its JSON in a PNG text chunk, so only a PNG can be a card. Any jpg/webp sitting in `characters/` can't be a card — there's nothing to repair and nothing to convert — so it's left untouched. (`/compress`, by contrast, handles PNG/JPG/WEBP.)
+
+Only files at the **root** of `characters/` are treated as cards. SillyTavern keeps a character's expression sprites in a subfolder named after it (`characters/<Name>/happy.png`, …); those aren't cards, so the character pass doesn't recurse into subfolders and never touches them. (`/compress` still walks `user/images/` recursively — both rules are specific to the character pass.)
+
 `characters/` is **never** converted to WEBP: character cards store their JSON in a PNG `chara`/`ccv3` text chunk, which WEBP can't carry, so converting them would corrupt the card. Otherwise the image is quantized and oversized cards are downscaled, exactly as in `/compress`.
 
 ### 1. Tag merge

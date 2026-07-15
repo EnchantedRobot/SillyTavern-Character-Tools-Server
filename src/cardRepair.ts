@@ -315,23 +315,42 @@ export interface ChunkRepairResult {
  * pass through untouched. When no card is found the chunks are returned
  * unchanged. Future card transforms slot in alongside merge + repair here.
  */
-export function repairCardChunks(textChunks: Chunk[], dictionary?: TagDictionary): ChunkRepairResult {
-    // Locate the card, preferring ccv3 (the newer, authoritative chunk).
-    let card: Card | null = null;
+/**
+ * Locate the character card in a PNG's text chunks, preferring the newer,
+ * authoritative `ccv3` chunk over the legacy `chara` chunk. Returns the decoded
+ * card, or null when no chunk holds valid card JSON.
+ */
+export function locateCard(textChunks: Chunk[]): Card | null {
     for (const keyword of ['ccv3', 'chara']) {
         for (const chunk of textChunks) {
             if (chunk.type !== 'tEXt') continue;
             const split = splitTextChunk(chunk.data);
             if (split?.keyword === keyword) {
                 const decoded = decodeCard(split.value);
-                if (decoded) {
-                    card = decoded;
-                    break;
-                }
+                if (decoded) return decoded;
             }
         }
-        if (card) break;
     }
+    return null;
+}
+
+/**
+ * Read a card's tag list from a PNG's text chunks: `data.tags` (the real V2/V3
+ * field, falling back to a root-level `tags` mirror), with non-string/blank
+ * entries dropped. Returns [] when there's no card or no tags. Read-only — used
+ * by the `/character-tags` survey that feeds the extension's dictionary editor.
+ */
+export function readCardTags(textChunks: Chunk[]): string[] {
+    const card = locateCard(textChunks);
+    if (!card) return [];
+    const data: Card = card.data && typeof card.data === 'object' ? card.data : card;
+    const tags = Array.isArray(data.tags) ? data.tags : Array.isArray(card.tags) ? card.tags : [];
+    return tags.filter((t: unknown): t is string => typeof t === 'string' && t.trim() !== '');
+}
+
+export function repairCardChunks(textChunks: Chunk[], dictionary?: TagDictionary): ChunkRepairResult {
+    // Locate the card, preferring ccv3 (the newer, authoritative chunk).
+    const card = locateCard(textChunks);
 
     if (!card) {
         return { chunks: textChunks, found: false, changed: false, repaired: false, tagsChanged: false, changes: [] };

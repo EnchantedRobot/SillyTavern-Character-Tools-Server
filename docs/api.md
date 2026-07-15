@@ -2,7 +2,7 @@
 
 All endpoints live under `/api/plugins/character-tools/`. Every request takes a JSON body with a `user` field matching a folder name under `data/` (e.g. `"default-user"`).
 
-The `fix-characters`, `compress`, and `reprocess-*` endpoints respond with a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream. `stats`, `users`, and `probe` return plain responses.
+The `fix-characters`, `compress`, and `reprocess-*` endpoints respond with a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream. `stats`, `character-tags`, `users`, and `probe` return plain responses.
 
 ## The SSE stream
 
@@ -135,6 +135,25 @@ interface DirStats {
     totalFiles: number;
     totalBytes: number;
     byType: Record<'png' | 'jpg' | 'gif' | 'webp' | 'other', { count: number; bytes: number }>;
+}
+```
+
+### `POST /character-tags`
+
+Read-only survey of a user's character tags, used by the extension's Tag Dictionary editor so its counts and "unassigned" discovery reflect the **selected** user (SillyTavern's in-browser character list only ever holds the logged-in user). Scans `characters/` with the same scope as the character pass — **root-level PNGs only** — decodes each card, and returns its tags. Cards with no tags are omitted. Plain JSON, no SSE.
+
+```bash
+curl -X POST http://localhost:8000/api/plugins/character-tools/character-tags \
+  -H "Content-Type: application/json" \
+  -d '{"user": "default-user"}'
+```
+
+```ts
+interface CharacterTagsResponse {
+    characters: {
+        avatar: string;   // card filename, e.g. "Seraphina.png"
+        tags: string[];   // the card's data.tags (blank/non-string entries dropped)
+    }[];
 }
 ```
 
